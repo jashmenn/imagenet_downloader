@@ -30,11 +30,14 @@ import threading
 import time
 import urllib2
 
-def download(url, timeout, retry, sleep):
+def download(url, timeout, retry, sleep, verbose=False):
     """Downloads a file at given URL."""
     count = 0
+
     while True:
         try:
+            if verbose:
+                sys.stderr.write('Downloading: ' + url + ' ('+ str(count) +')\n')
             f = urllib2.urlopen(url, timeout=timeout)
             if f is None:
                 raise Exception('Cannot open URL {0}'.format(url))
@@ -46,6 +49,8 @@ def download(url, timeout, retry, sleep):
                 count += 1
                 if count > retry:
                     raise
+            else:
+                raise
         except urllib2.URLError as e:
             if isinstance(e.reason, socket.gaierror):
                 count += 1
@@ -53,6 +58,11 @@ def download(url, timeout, retry, sleep):
                 if count > retry:
                     raise
             else:
+                raise
+        except:
+            count += 1
+            time.sleep(sleep)
+            if count > retry:
                 raise
 
     return content
@@ -120,14 +130,23 @@ def download_imagenet(list_filename,
                     counts_fail[i] += 1
                     continue
 
+                # hacky way to cache files, will only cache jpgs
                 directory = os.path.join(out_dir, name.split('_')[0])
-                content = download(url, timeout, retry, sleep_after_dl)
+                ext = "jpg" # hack
+                path = os.path.join(directory, '{0}.{1}'.format(name, ext))
+                if os.path.isfile(path):
+                  if verbose:
+                      sys.stderr.write('Already have: ' + path + ' . Skipping\n')
+                  counts_success[i] += 1 # track skips?
+                  continue
+
+                content = download(url, timeout, retry, sleep_after_dl, verbose)
                 ext = imgtype2ext(imghdr.what('', content))
+                path = os.path.join(directory, '{0}.{1}'.format(name, ext))
                 try:
                     make_directory(directory)
                 except:
                     pass
-                path = os.path.join(directory, '{0}.{1}'.format(name, ext))
                 with open(path, 'w') as f:
                     f.write(content)
                 counts_success[i] += 1
@@ -192,7 +211,7 @@ if __name__ == '__main__':
                    help='Number of parallel threads to download')
     p.add_argument('--timeout', '-t', type=int, default=10,
                    help='Timeout per image in seconds')
-    p.add_argument('--retry', '-r', type=int, default=10,
+    p.add_argument('--retry', '-r', type=int, default=2,
                    help='Max count of retry for each image')
     p.add_argument('--sleep', '-s', type=float, default=1,
                    help='Sleep after download each image in second')
