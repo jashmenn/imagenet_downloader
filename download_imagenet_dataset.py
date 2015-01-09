@@ -29,8 +29,9 @@ import tempfile
 import threading
 import time
 import urllib2
+import eventlet
 
-def download(url, timeout, retry, sleep, verbose=False):
+def download(url, timeoutF, retry, sleep, verbose=False):
     """Downloads a file at given URL."""
     count = 0
 
@@ -38,7 +39,7 @@ def download(url, timeout, retry, sleep, verbose=False):
         try:
             if verbose:
                 sys.stderr.write('Downloading: ' + url + ' ('+ str(count) +')\n')
-            f = urllib2.urlopen(url, timeout=timeout)
+            f = urllib2.urlopen(url, timeout=timeoutF)
             if f is None:
                 raise Exception('Cannot open URL {0}'.format(url))
             content = f.read()
@@ -79,9 +80,11 @@ def make_directory(path):
     if not os.path.isdir(path):
         os.makedirs(path)
 
+
+
 def download_imagenet(list_filename,
                       out_dir,
-                      timeout=10,
+                      timeoutF=10,
                       retry=10,
                       num_jobs=1,
                       sleep_after_dl=1,
@@ -101,63 +104,61 @@ def download_imagenet(list_filename,
 
     num_jobs = max(num_jobs, 1)
 
-    entries = Queue.Queue(num_jobs)
-    done = [False]
+    entries = []
+
+    with open(list_filename) as list_in:
+        for line in list_in:
+            pair = line.strip().split(None, 1)
+            if(len(pair) < 2):
+              continue
+            name, url = pair
+            entries.append((name, url))
 
     counts_fail = [0 for i in xrange(num_jobs)]
     counts_success = [0 for i in xrange(num_jobs)]
 
-    def producer():
-        with open(list_filename) as list_in:
-            for line in list_in:
-                name, url = line.strip().split(None, 1)
-                entries.put((name, url), block=True)
+    def consumer(entry):
+      timeout = eventlet.timeout.Timeout(timeoutF)
+      try:
+          name, url = entry[0], entry[1]
+      except:
+          return
 
-        entries.join()
-        done[0] = True
+      try:
+          if name is None:
+              if verbose:
+                  sys.stderr.write('Error: Invalid line: ' + line)
+              counts_fail[i] += 1
+              return
 
-    def consumer(i):
-        while not done[0]:
-            try:
-                name, url = entries.get(timeout=1)
-            except:
-                continue
+          # hacky way to cache files, will only cache jpgs
+          directory = os.path.join(out_dir, name.split('_')[0])
+          ext = "jpg" # hack
+          path = os.path.join(directory, '{0}.{1}'.format(name, ext))
+          if os.path.isfile(path):
+            if verbose:
+                sys.stderr.write('Already have: ' + path + ' . Skipping\n')
+            counts_success[i] += 1 # track skips?
+            return
 
-            try:
-                if name is None:
-                    if verbose:
-                        sys.stderr.write('Error: Invalid line: ' + line)
-                    counts_fail[i] += 1
-                    continue
+          content = download(url, timeoutF, retry, sleep_after_dl, verbose)
+          ext = imgtype2ext(imghdr.what('', content))
+          path = os.path.join(directory, '{0}.{1}'.format(name, ext))
+          try:
+              make_directory(directory)
+          except:
+              pass
+          with open(path, 'w') as f:
+              f.write(content)
+          counts_success[i] += 1
+          timeout.cancel()
+          time.sleep(sleep_after_dl)
 
-                # hacky way to cache files, will only cache jpgs
-                directory = os.path.join(out_dir, name.split('_')[0])
-                ext = "jpg" # hack
-                path = os.path.join(directory, '{0}.{1}'.format(name, ext))
-                if os.path.isfile(path):
-                  if verbose:
-                      sys.stderr.write('Already have: ' + path + ' . Skipping\n')
-                  counts_success[i] += 1 # track skips?
-                  continue
-
-                content = download(url, timeout, retry, sleep_after_dl, verbose)
-                ext = imgtype2ext(imghdr.what('', content))
-                path = os.path.join(directory, '{0}.{1}'.format(name, ext))
-                try:
-                    make_directory(directory)
-                except:
-                    pass
-                with open(path, 'w') as f:
-                    f.write(content)
-                counts_success[i] += 1
-                time.sleep(sleep_after_dl)
-
-            except Exception as e:
-                counts_fail[i] += 1
-                if verbose:
-                    sys.stderr.write('Error: {0}: {1}\n'.format(name, e))
-
-            entries.task_done()
+      except Exception as e:
+          timeout.cancel()
+          counts_fail[i] += 1
+          if verbose:
+              sys.stderr.write('Error: {0}: {1}\n'.format(name, e))
 
     def message_loop():
         if verbose:
@@ -165,7 +166,7 @@ def download_imagenet(list_filename,
         else:
             delim = '\r'
 
-        while not done[0]:
+        while True:
             count_success = sum(counts_success)
             count = count_success + sum(counts_fail)
             rate_done = count * 100.0 / count_total
@@ -180,25 +181,14 @@ def download_imagenet(list_filename,
             time.sleep(1)
         sys.stderr.write('done')
 
-    producer_thread = threading.Thread(target=producer)
-    consumer_threads = [threading.Thread(target=consumer, args=(i,)) for i in xrange(num_jobs)]
     message_thread = threading.Thread(target=message_loop)
 
-    producer_thread.start()
-    for t in consumer_threads:
-        t.start()
     message_thread.start()
 
-    # Explicitly wait to accept SIGINT
-    try:
-        while producer_thread.isAlive():
-            time.sleep(1)
-    except:
-        sys.exit(1)
+    pool = eventlet.GreenPool(num_jobs)
+    for body in pool.imap(consumer, entries):
+      True
 
-    producer_thread.join()
-    for t in consumer_threads:
-        t.join()
     message_thread.join()
 
     sys.stderr.write('\ndone\n')
@@ -220,5 +210,5 @@ if __name__ == '__main__':
     args = p.parse_args()
 
     download_imagenet(args.list, args.outdir,
-                      timeout=args.timeout, retry=args.retry,
+                      timeoutF=args.timeout, retry=args.retry,
                       num_jobs=args.jobs, verbose=args.verbose)
